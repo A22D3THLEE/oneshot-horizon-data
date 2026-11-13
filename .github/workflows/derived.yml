@@ -1,0 +1,144 @@
+name: Horizon data pack
+# Makes horizon-derived.zip for one commit of the Android port (Rayan-XOO/horizon) and publishes it as
+# the release derived-<12 hex of the commit>, which the APK built from that commit downloads on its
+# first run (oneshot-horizon-builds android.yml sets HORIZON_DERIVED_URL to it when the release exists).
+# The commit: the `ref` input, else the one oneshot-horizon-builds pins (PORT_PINNED in its android.yml).
+# A commit whose release exists is skipped unless `force` is on. Daily, so a new pin gets its pack.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit of Rayan-XOO/horizon (empty = the one oneshot-horizon-builds pins)
+        required: false
+        default: ''
+      force:
+        description: Make the pack again even if its release exists (it is replaced)
+        type: boolean
+        default: false
+  schedule:
+    - cron: '41 5 * * *'
+permissions:
+  contents: write
+concurrency:
+  group: derived-pack
+  cancel-in-progress: false
+env:
+  PORT: Rayan-XOO/horizon
+  BUILDS: A22D3THLEE/oneshot-horizon-builds
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: never
+      HORIZON_TELEMETRY_URL: 'off'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: data
+          persist-credentials: false
+      - name: Which commit
+        id: which
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          sha="$REF"
+          if [[ -z "$sha" ]]; then
+            sha=$(curl -fsSL "https://raw.githubusercontent.com/$BUILDS/main/.github/workflows/android.yml" \
+              | sed -n -E 's/^ *PORT_PINNED: *([0-9a-f]{40}) *$/\1/p' | head -n1)
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no full 40-hex commit (got '$sha')"; exit 1; }
+          tag="derived-${sha:0:12}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [[ "$FORCE" != "true" ]]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "$tag exists: nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: The port's source
+        if: steps.which.outputs.skip != '1'
+        env:
+          SHA: ${{ steps.which.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/$PORT"
+          git fetch -q --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+          git log -1 --oneline
+      - uses: actions/setup-java@v4
+        if: steps.which.outputs.skip != '1'
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Rust
+        if: steps.which.outputs.skip != '1'
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        if: steps.which.outputs.skip != '1'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/target
+          key: prepare-${{ hashFiles('src/Cargo.lock') }}
+          restore-keys: prepare-
+      - name: Minecraft from Mojang
+        if: steps.which.outputs.skip != '1'
+        run: python3 -I data/tools/fetch_game.py src/research-lock.json "$RUNNER_TEMP/minecraft"
+      - name: horizon-prepare
+        if: steps.which.outputs.skip != '1'
+        run: |
+          set -euo pipefail
+          cd src
+          cargo build --release --locked -p horizon-prepare --bin horizon-prepare
+          if ! target/release/horizon-prepare --prepare --minecraft-dir "$RUNNER_TEMP/minecraft" \
+              --server-jar "$RUNNER_TEMP/minecraft/server.jar" --root "$PWD" > "$RUNNER_TEMP/prepare.log" 2>&1; then
+            tail -n 60 "$RUNNER_TEMP/prepare.log"; exit 1
+          fi
+          tail -n 15 "$RUNNER_TEMP/prepare.log"
+      - name: The pack
+        if: steps.which.outputs.skip != '1'
+        run: |
+          set -euo pipefail
+          version=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["minecraft"]["version"])' src/research-lock.json)
+          prepared="$PWD/src/.local/horizon-client/$version"
+          for f in horizon-resources.json facts.json; do
+            [[ -f "$prepared/$f" ]] || { echo "::error::horizon-prepare made no $f"; exit 1; }
+          done
+          bash src/packaging/android/make_derived_pack.sh "$prepared" "$RUNNER_TEMP/out/horizon-derived.zip"
+          cd "$RUNNER_TEMP/out"
+          python3 -I - <<'PY'
+          import zipfile
+          names = set(zipfile.ZipFile("horizon-derived.zip").namelist())
+          missing = {"horizon-resources.json", "facts.json"} - names
+          if missing:
+              raise SystemExit(f"the pack lacks {sorted(missing)}")
+          print(f"{len(names)} entries")
+          PY
+          sha256sum horizon-derived.zip | tee horizon-derived.zip.sha256
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Publish
+        if: steps.which.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.which.outputs.tag }}
+          SHA: ${{ steps.which.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/out"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" -y --cleanup-tag 2>/dev/null || true
+          notes=$(printf 'Horizon data pack for the Android port\n\nport commit: %s\nMinecraft: %s\nsha256: %s\nsize: %s bytes\n' \
+            "$SHA" "$VERSION" "$(cut -d' ' -f1 horizon-derived.zip.sha256)" "$(stat -c %s horizon-derived.zip)")
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Data pack ${SHA:0:12} (Minecraft $VERSION)" \
+            --notes "$notes" horizon-derived.zip horizon-derived.zip.sha256
+          { echo "### $TAG"; echo "$notes"; } >> "$GITHUB_STEP_SUMMARY"
